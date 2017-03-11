@@ -64,8 +64,10 @@ import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Message;
+import android.os.Process;
 import android.os.StrictMode;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.text.Selection;
 import android.text.SpannableStringBuilder;
 import android.text.TextUtils;
@@ -126,6 +128,9 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import android.os.SystemProperties;
+
+import android.provider.Settings;
 
 /**
  * Default launcher application.
@@ -134,6 +139,7 @@ public class Launcher extends Activity
         implements View.OnClickListener, OnLongClickListener, LauncherModel.Callbacks,
                    View.OnTouchListener, PageSwitchListener, LauncherProviderChangeListener {
     static final String TAG = "Launcher";
+    static final float ALL_APPS_ALPHA = 0f;
     static final boolean LOGD = false;
 
     static final boolean PROFILE_STARTUP = false;
@@ -215,6 +221,8 @@ public class Launcher extends Activity
 
     public static final String USER_HAS_MIGRATED = "launcher.user_migrated_from_old_data";
 
+    private boolean runOnce = false;
+
     /** The different states that Launcher can be in. */
     private enum State { NONE, WORKSPACE, APPS_CUSTOMIZE, APPS_CUSTOMIZE_SPRING_LOADED };
     private State mState = State.WORKSPACE;
@@ -241,11 +249,15 @@ public class Launcher extends Activity
     private static int NEW_APPS_PAGE_MOVE_DELAY = 500;
     private static int NEW_APPS_ANIMATION_INACTIVE_TIMEOUT_SECONDS = 5;
     private static int NEW_APPS_ANIMATION_DELAY = 500;
-    private static final int SINGLE_FRAME_DELAY = 16;
+    private static final int SINGLE_FRAME_DELAY = 0;
 
     private final BroadcastReceiver mCloseSystemDialogsReceiver
             = new CloseSystemDialogsIntentReceiver();
+    private final BroadcastReceiver mPreScanFinishReceiver
+            = new PreScanFinishedReceiver();
     private final ContentObserver mWidgetObserver = new AppWidgetResetObserver();
+
+    private boolean mPreScanFinished = false;
 
     private LayoutInflater mInflater;
 
@@ -313,6 +325,7 @@ public class Launcher extends Activity
 
     // Related to the auto-advancing of widgets
     private final int ADVANCE_MSG = 1;
+    private final int LOADER_MSG = ADVANCE_MSG + 1;
     private final int mAdvanceInterval = 20000;
     private final int mAdvanceStagger = 250;
     private long mAutoAdvanceSentTime;
@@ -377,6 +390,7 @@ public class Launcher extends Activity
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        //SystemProperties.set("persist.sys.default_launcher", "com.android.launcher3");
         if (DEBUG_STRICT_MODE) {
             StrictMode.setThreadPolicy(new StrictMode.ThreadPolicy.Builder()
                     .detectDiskReads()
@@ -433,7 +447,10 @@ public class Launcher extends Activity
         }
 
         checkForLocaleChange();
-        setContentView(R.layout.launcher);
+	if(0 != Settings.System.getInt(getContentResolver(), "multi_window_config", 0))
+	      setContentView(R.layout.launcher_win);
+	else
+              setContentView(R.layout.launcher);
 
         setupViews();
         grid.layout(this);
@@ -449,15 +466,27 @@ public class Launcher extends Activity
             android.os.Debug.stopMethodTracing();
         }
 
-        if (!mRestoring) {
-            if (DISABLE_SYNCHRONOUS_BINDING_CURRENT_PAGE) {
-                // If the user leaves launcher, then we should just load items asynchronously when
-                // they return.
-                mModel.startLoader(true, PagedView.INVALID_RESTORE_PAGE);
-            } else {
-                // We only load the page synchronously if the user rotates (or triggers a
-                // configuration change) while launcher is in the foreground
-                mModel.startLoader(true, mWorkspace.getRestorePage());
+        if ("false".equals(SystemProperties.get("sys.pms.finishscan", "unknown"))) {
+            // Register for prescan finish message
+            IntentFilter prescanFilter = new IntentFilter();
+            prescanFilter.addAction("com.android.prescan.FINISH");
+            registerReceiver(mPreScanFinishReceiver, prescanFilter);
+
+            NotificationController.initNotify(this);
+            NotificationController.showNotify(this);
+
+            mHandler.sendEmptyMessageDelayed(LOADER_MSG, 1);
+        } else {
+            if (!mRestoring) {
+                if (DISABLE_SYNCHRONOUS_BINDING_CURRENT_PAGE) {
+                    // If the user leaves launcher, then we should just load items asynchronously when
+                    // they return.
+                    mModel.startLoader(true, PagedView.INVALID_RESTORE_PAGE);
+                } else {
+                    // We only load the page synchronously if the user rotates (or triggers a
+                    // configuration change) while launcher is in the foreground
+                    mModel.startLoader(true, mWorkspace.getRestorePage());
+                }
             }
         }
 
@@ -1850,7 +1879,9 @@ public class Launcher extends Activity
     private final Handler mHandler = new Handler() {
         @Override
         public void handleMessage(Message msg) {
-            if (msg.what == ADVANCE_MSG) {
+            //if (msg.what == ADVANCE_MSG) {
+            switch(msg.what){
+            case ADVANCE_MSG:
                 int i = 0;
                 for (View key: mWidgetsToAdvance.keySet()) {
                     final View v = key.findViewById(mWidgetsToAdvance.get(key).autoAdvanceViewId);
@@ -1865,6 +1896,29 @@ public class Launcher extends Activity
                     i++;
                 }
                 sendAdvanceMessage(mAdvanceInterval);
+                break;
+            case LOADER_MSG:
+                if (!mRestoring && mPreScanFinished) {
+                    mModel.startLoaderApp(true, mWorkspace!=null ? mWorkspace.getCurrentPage() : 0);
+                    mHandler.removeMessages(LOADER_MSG);
+                    if (DISABLE_SYNCHRONOUS_BINDING_CURRENT_PAGE) {
+                        // If the user leaves launcher, then we should just load items asynchronously when
+                        // they return.
+                        mModel.startLoader(true, PagedView.INVALID_RESTORE_PAGE);
+                    } else {
+                        // We only load the page synchronously if the user rotates (or triggers a
+                        // configuration change) while launcher is in the foreground
+                        mModel.startLoader(true, mWorkspace.getRestorePage());
+                    }
+                }else{
+                    mModel.startLoaderApp(true, mWorkspace!=null ? mWorkspace.getCurrentPage() : 0);
+                    if(!runOnce) {
+                        runOnce = true;
+                        mModel.startLoader(true, mWorkspace.getRestorePage());
+                    }
+                    mHandler.sendEmptyMessageDelayed(LOADER_MSG, 5000);
+                }
+                break;
             }
         }
     };
@@ -2006,7 +2060,11 @@ public class Launcher extends Activity
 
     @Override
     public void onRestoreInstanceState(Bundle state) {
-        super.onRestoreInstanceState(state);
+        //super.onRestoreInstanceState(state);
+        try {
+            super.onRestoreInstanceState(state);
+        }catch (Exception e) {}
+            state=null;
         for (int page: mSynchronouslyBoundPages) {
             mWorkspace.restoreInstanceStateForChild(page);
         }
@@ -2096,6 +2154,7 @@ public class Launcher extends Activity
         }
 
         getContentResolver().unregisterContentObserver(mWidgetObserver);
+        getContentResolver().unregisterContentObserver(mMultiConfigObserver);
         unregisterReceiver(mCloseSystemDialogsReceiver);
 
         mDragLayer.clearAllResizeFrames();
@@ -2449,7 +2508,21 @@ public class Launcher extends Activity
         ContentResolver resolver = getContentResolver();
         resolver.registerContentObserver(LauncherProvider.CONTENT_APPWIDGET_RESET_URI,
                 true, mWidgetObserver);
+	//huangjc:multi_window
+	resolver.registerContentObserver(Settings.System.getUriFor("multi_window_config"),
+		false,mMultiConfigObserver);
     }
+
+    //huangjc:multi_window
+    private ContentObserver mMultiConfigObserver = new ContentObserver(new Handler()){
+	    @Override
+	    public void onChange(boolean selfChange) {
+		    final boolean isshow = 0 != Settings.System.getInt(
+				    getContentResolver(), "multi_window_config", 0);
+		    Log.d("hjc","=====mMultiConfigObserver====mHotseat:"+isshow);
+		    finish();
+	    }
+    };//multi_window end
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
@@ -2724,11 +2797,15 @@ public class Launcher extends Activity
         }
 
         boolean success = startActivitySafely(v, intent, tag);
+        Resources res = getResources();
+        boolean material = res.getBoolean(R.bool.use_lollipop_animate);
         mStats.recordLaunch(intent, shortcut);
 
         if (success && v instanceof BubbleTextView) {
             mWaitingForResume = (BubbleTextView) v;
-            mWaitingForResume.setStayPressed(true);
+            if(material){
+                mWaitingForResume.setStayPressed(true);
+            }
         }
     }
 
@@ -2939,8 +3016,10 @@ public class Launcher extends Activity
             }
 
             Bundle optsBundle = null;
+            Resources res = getResources();
+            boolean material = res.getBoolean(R.bool.use_lollipop_animate);
             if (useLaunchAnimation) {
-                ActivityOptions opts = Utilities.isLmpOrAbove() ?
+                ActivityOptions opts = Utilities.isLmpOrAbove() && material?
                         ActivityOptions.makeCustomAnimation(this, R.anim.task_open_enter, R.anim.no_anim) :
                         ActivityOptions.makeScaleUpAnimation(v, 0, 0, v.getMeasuredWidth(), v.getMeasuredHeight());
                 optsBundle = opts.toBundle();
@@ -3223,7 +3302,8 @@ public class Launcher extends Activity
     }
 
     private void setWorkspaceBackground(boolean workspace) {
-        mLauncherView.setBackground(workspace ?
+        boolean isMultiMode = (0 != Settings.System.getInt(getContentResolver(), "multi_window_config", 0));
+        mLauncherView.setBackground(workspace&&!isMultiMode ?
                 mWorkspaceBackgroundDrawable : null);
     }
 
@@ -3325,9 +3405,9 @@ public class Launcher extends Activity
             mStateAnimation = null;
         }
 
-        boolean material = Utilities.isLmpOrAbove();
-
+        //boolean material = Utilities.isLmpOrAbove();
         final Resources res = getResources();
+        boolean material = res.getBoolean(R.bool.use_lollipop_animate) && Utilities.isLmpOrAbove();
 
         final int duration = res.getInteger(R.integer.config_appsCustomizeZoomInTime);
         final int fadeDuration = res.getInteger(R.integer.config_appsCustomizeFadeInTime);
@@ -3336,6 +3416,7 @@ public class Launcher extends Activity
                 res.getInteger(R.integer.config_appsCustomizeItemsAlphaStagger);
 
         final float scale = (float) res.getInteger(R.integer.config_appsCustomizeZoomScaleFactor);
+
         final View fromView = mWorkspace;
         final AppsCustomizeTabHost toView = mAppsCustomizeTabHost;
 
@@ -3402,6 +3483,9 @@ public class Launcher extends Activity
             revealView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
             layerViews.add(revealView);
             PropertyValuesHolder panelAlpha = PropertyValuesHolder.ofFloat("alpha", initAlpha, 1f);
+            if(!material){
+                panelAlpha = PropertyValuesHolder.ofFloat("alpha", initAlpha, ALL_APPS_ALPHA);
+            }
             PropertyValuesHolder panelDriftY =
                     PropertyValuesHolder.ofFloat("translationY", yDrift, 0);
             PropertyValuesHolder panelDriftX =
@@ -3421,11 +3505,11 @@ public class Launcher extends Activity
                 layerViews.add(page);
 
                 ObjectAnimator pageDrift = ObjectAnimator.ofFloat(page, "translationY", yDrift, 0);
-                page.setTranslationY(yDrift);
+                page.setTranslationY(0);
                 pageDrift.setDuration(revealDuration);
                 pageDrift.setInterpolator(new LogDecelerateInterpolator(100, 0));
                 pageDrift.setStartDelay(itemsAlphaStagger);
-                mStateAnimation.play(pageDrift);
+              //  mStateAnimation.play(pageDrift);
 
                 page.setAlpha(0f);
                 ObjectAnimator itemsAlpha = ObjectAnimator.ofFloat(page, "alpha", 0f, 1f);
@@ -3436,11 +3520,12 @@ public class Launcher extends Activity
             }
 
             View pageIndicators = toView.findViewById(R.id.apps_customize_page_indicator);
-            pageIndicators.setAlpha(0.01f);
+            //pageIndicators.setAlpha(0.01f);
+            pageIndicators.setAlpha(1f);
             ObjectAnimator indicatorsAlpha =
                     ObjectAnimator.ofFloat(pageIndicators, "alpha", 1f);
             indicatorsAlpha.setDuration(revealDuration);
-            mStateAnimation.play(indicatorsAlpha);
+            //mStateAnimation.play(indicatorsAlpha);
 
             if (material) {
                 final View allApps = getAllAppsButton();
@@ -3559,8 +3644,9 @@ public class Launcher extends Activity
             mStateAnimation = null;
         }
 
-        boolean material = Utilities.isLmpOrAbove();
+        //boolean material = Utilities.isLmpOrAbove();
         Resources res = getResources();
+        boolean material = res.getBoolean(R.bool.use_lollipop_animate) && Utilities.isLmpOrAbove();
 
         final int duration = res.getInteger(R.integer.config_appsCustomizeZoomOutTime);
         final int fadeOutDuration = res.getInteger(R.integer.config_appsCustomizeFadeOutTime);
@@ -3665,13 +3751,18 @@ public class Launcher extends Activity
                 panelDriftX.setDuration(revealDuration - SINGLE_FRAME_DELAY);
                 panelDriftX.setStartDelay(itemsAlphaStagger + SINGLE_FRAME_DELAY);
                 panelDriftX.setInterpolator(decelerateInterpolator);
-                mStateAnimation.play(panelDriftX);
+              //  mStateAnimation.play(panelDriftX);
 
                 if (isWidgetTray || !material) {
                     float finalAlpha = material ? 0.4f : 0f;
                     revealView.setAlpha(1f);
                     ObjectAnimator panelAlpha = LauncherAnimUtils.ofFloat(revealView, "alpha",
                             1f, finalAlpha);
+                    if(!material){
+                        revealView.setAlpha(ALL_APPS_ALPHA);
+                        panelAlpha = LauncherAnimUtils.ofFloat(revealView, "alpha",
+                                ALL_APPS_ALPHA, finalAlpha);
+                    }
                     panelAlpha.setDuration(material ? revealDuration : 150);
                     panelAlpha.setInterpolator(decelerateInterpolator);
                     panelAlpha.setStartDelay(material ? 0 : itemsAlphaStagger + SINGLE_FRAME_DELAY);
@@ -3683,26 +3774,27 @@ public class Launcher extends Activity
 
                     ObjectAnimator pageDrift = LauncherAnimUtils.ofFloat(page, "translationY",
                             0, yDrift);
-                    page.setTranslationY(0);
+                 //   page.setTranslationY(0);
                     pageDrift.setDuration(revealDuration - SINGLE_FRAME_DELAY);
                     pageDrift.setInterpolator(decelerateInterpolator);
                     pageDrift.setStartDelay(itemsAlphaStagger + SINGLE_FRAME_DELAY);
-                    mStateAnimation.play(pageDrift);
+                 //   mStateAnimation.play(pageDrift);
 
                     page.setAlpha(1f);
                     ObjectAnimator itemsAlpha = LauncherAnimUtils.ofFloat(page, "alpha", 1f, 0f);
-                    itemsAlpha.setDuration(100);
+                    itemsAlpha.setDuration(/*100*/60);
                     itemsAlpha.setInterpolator(decelerateInterpolator);
                     mStateAnimation.play(itemsAlpha);
                 }
 
                 View pageIndicators = fromView.findViewById(R.id.apps_customize_page_indicator);
-                pageIndicators.setAlpha(1f);
+              //  pageIndicators.setAlpha(1f);
+                pageIndicators.setAlpha(0f);
                 ObjectAnimator indicatorsAlpha =
                         LauncherAnimUtils.ofFloat(pageIndicators, "alpha", 0f);
                 indicatorsAlpha.setDuration(revealDuration);
                 indicatorsAlpha.setInterpolator(new DecelerateInterpolator(1.5f));
-                mStateAnimation.play(indicatorsAlpha);
+              //  mStateAnimation.play(indicatorsAlpha);
 
                 width = revealView.getMeasuredWidth();
 
@@ -3743,6 +3835,8 @@ public class Launcher extends Activity
                     fromView.setVisibility(View.GONE);
                     dispatchOnLauncherTransitionEnd(fromView, animated, true);
                     dispatchOnLauncherTransitionEnd(toView, animated, true);
+                    Resources res = getResources();
+                    boolean material = res.getBoolean(R.bool.use_lollipop_animate);
                     if (onCompleteRunnable != null) {
                         onCompleteRunnable.run();
                     }
@@ -3763,7 +3857,11 @@ public class Launcher extends Activity
                     if (page != null) {
                         page.setTranslationX(0);
                         page.setTranslationY(0);
-                        page.setAlpha(1);
+                        if(material){
+                            page.setAlpha(1);
+                        }else{
+                            page.setAlpha(ALL_APPS_ALPHA);
+                        }
                     }
                     content.setCurrentPage(content.getNextPage());
 
@@ -4029,6 +4127,19 @@ public class Launcher extends Activity
     }
 
     /**
+     * Receives notifications when system dialogs are to be closed.
+     */
+    private class PreScanFinishedReceiver extends BroadcastReceiver {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            mPreScanFinished = true;
+            if(NotificationController.hasNotification == true){
+                NotificationController.clearAllNotify(context);
+            }
+        }
+    }
+
+    /**
      * Receives notifications whenever the appwidgets are reset.
      */
     private class AppWidgetResetObserver extends ContentObserver {
@@ -4057,7 +4168,7 @@ public class Launcher extends Activity
      * skip some work in that case since we will come back again.
      */
     private boolean waitUntilResume(Runnable run, boolean deletePreviousRunnables) {
-        if (mPaused) {
+        if (mPaused&&(0 == Settings.System.getInt(getContentResolver(), "multi_window_config", 0))) {
             Log.i(TAG, "Deferring update until onResume");
             if (deletePreviousRunnables) {
                 while (mBindOnResumeCallbacks.remove(run)) {
@@ -4558,6 +4669,10 @@ public class Launcher extends Activity
 
     private boolean canRunNewAppsAnimation() {
         long diff = System.currentTimeMillis() - mDragController.getLastGestureUpTime();
+         //huangjc:multi_window
+            if(0 != Settings.System.getInt(getContentResolver(), "multi_window_config", 0))
+              return true;
+        //multi_window end
         return diff > (NEW_APPS_ANIMATION_INACTIVE_TIMEOUT_SECONDS * 1000);
     }
 
